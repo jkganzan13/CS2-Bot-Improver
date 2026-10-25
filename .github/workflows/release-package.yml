@@ -181,12 +181,62 @@ jobs:
       BASE_TAG: ${{ needs.versions.outputs.base_tag }}
       CSS_TAG: ${{ needs.versions.outputs.css_tag }}
       MMS_BUILD: ${{ needs.versions.outputs.mms_build }}
+      # Content updater: the build number orders releases; the feed is this repo's latest release
+      BUILD: ${{ github.run_number }}
+      UPDATE_FEED: https://github.com/${{ github.repository }}/releases/latest/download
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v8
         with:
           path: overlays
+
+      - id: tag
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="${BASE_TAG}-fork.${BUILD}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "PUBLISHED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Update signing key
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          PUBLISHING: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/update-signing-key.pem"
+          if [ -n "${UPDATE_SIGNING_KEY:-}" ]; then
+            printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+            echo "Using the UPDATE_SIGNING_KEY secret"
+          elif [ "$PUBLISHING" = true ]; then
+            echo "::error::Set the UPDATE_SIGNING_KEY secret before publishing (see release/README.md)"
+            exit 1
+          else
+            openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$key" 2>/dev/null
+            echo "::warning::UPDATE_SIGNING_KEY is not set: this test build is signed with a throwaway key"
+          fi
+          chmod 600 "$key"
+          echo "UPDATE_KEY=$key" >> "$GITHUB_ENV"
+          echo "UPDATE_KEY_FINGERPRINT=$(python3 -I release/update_feed.py fingerprint --key "$key")" >> "$GITHUB_ENV"
+
+      - name: Stage the content updater
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          cp -r release/updater staged/updater
+          python3 -I release/update_feed.py pubkey-xml --key "$UPDATE_KEY" > "$RUNNER_TEMP/pubkey.xml"
+          python3 -I - staged/updater/addons/cs2botimprover/update.ps1 "$UPDATE_FEED" "$RUNNER_TEMP/pubkey.xml" <<'PY'
+          import sys, pathlib
+          script, feed, key = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3]).read_text().strip()
+          data = script.read_bytes()
+          for placeholder, value in ((b"__UPDATE_FEED__", feed), (b"__UPDATE_PUBLIC_KEY_XML__", key)):
+              assert data.count(placeholder) == 1, placeholder
+              data = data.replace(placeholder, value.encode())
+          script.write_bytes(data)
+          PY
+          grep -q '<RSAKeyValue>' staged/updater/addons/cs2botimprover/update.ps1
+          file staged/updater/CS2BotImprover-Update.cmd | grep -q CRLF || { echo "::error::the .cmd launcher must have CRLF line endings"; exit 1; }
 
       - name: Download base release, CounterStrikeSharp and Metamod
         run: |
@@ -217,6 +267,7 @@ jobs:
           mkdir -p dist
           overlay_args=()
           for d in overlays/*/; do overlay_args+=(--overlay "$d"); done
+          overlay_args+=(--overlay staged/updater)
 
           {
             echo "## Components"
@@ -244,6 +295,12 @@ jobs:
               --require addons/counterstrikesharp/bin/win64/counterstrikesharp.dll \
               --require addons/counterstrikesharp/api/CounterStrikeSharp.API.dll \
               --require addons/counterstrikesharp/plugins/BotAI/BotAI.dll \
+              --require addons/cs2botimprover/update.ps1 \
+              --require CS2BotImprover-Update.cmd \
+              --install-json addons/cs2botimprover/install.json \
+              --meta "version=$TAG" --meta "build=$BUILD" --meta "published=$PUBLISHED" \
+              --meta "variant=$(basename "$zip" .zip)" --meta "repo=${{ github.repository }}" \
+              --meta "base=$BASE_REPO $BASE_TAG" --meta "counterstrikesharp=$CSS_TAG" --meta "metamod=$MMS_FILE" \
               --out "dist/$(basename "$zip")" \
               --report report.md
           done
@@ -254,11 +311,22 @@ jobs:
           ls -la dist
           cat report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - id: tag
+      - name: Build and sign the update feed
         run: |
-          tag="${{ inputs.tag }}"
-          [ -n "$tag" ] || tag="${BASE_TAG}-fork.${{ github.run_number }}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          python3 -I release/update_feed.py build --dist dist --repo "${{ github.repository }}" \
+            --tag "$TAG" --build "$BUILD" --published "$PUBLISHED" --out dist/latest.json
+          python3 -I release/update_feed.py sign --key "$UPDATE_KEY" --file dist/latest.json
+          python3 -I release/update_feed.py verify --key "$UPDATE_KEY" --file dist/latest.json
+          {
+            echo
+            echo "## Update feed"
+            echo
+            echo "- Build: $BUILD ($TAG)"
+            echo "- Signing key SHA-256: \`$UPDATE_KEY_FINGERPRINT\`"
+            echo "- Feed: $UPDATE_FEED/latest.json"
+          } | tee -a report.md >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$UPDATE_KEY"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -268,10 +336,36 @@ jobs:
             report.md
           if-no-files-found: error
 
+  # ------------------------------------------------------- updater test
+  updater-test:
+    needs: package
+    if: always() && needs.package.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [CS2BotImprover, CS2BotImprover_rules_unchanged]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: release/tests
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+
+      - name: Run the packaged updater (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path "dist/${{ matrix.variant }}.zip")) { Write-Host "No ${{ matrix.variant }} package in this build"; exit 0 }
+          ./release/tests/test-updater.ps1 -Dist dist -Variant ${{ matrix.variant }}
+
   # ------------------------------------------------------------- release
   release:
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.release && needs.package.result == 'success'
-    needs: package
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.release && needs.package.result == 'success' && needs.updater-test.result == 'success'
+    needs: [package, updater-test]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -290,7 +384,12 @@ jobs:
           {
             echo "Repackaged build for the current CS2 update. Windows only."
             echo
+            echo "**Already installed a build from this fork?** Close CS2 and double-click"
+            echo "\`CS2BotImprover-Update.cmd\` in your \`game/csgo\` folder instead of reinstalling."
+            echo "Your edited settings are kept, and replaced files are backed up."
+            echo
             cat report.md
           } > notes.md
+          # --latest: the updater reads releases/latest/download/latest.json
           gh release create "$TAG" dist/* -R "${{ github.repository }}" \
-            --target "${{ github.sha }}" --title "$TAG" --notes-file notes.md
+            --target "${{ github.sha }}" --title "$TAG" --notes-file notes.md --latest

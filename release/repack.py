@@ -12,11 +12,19 @@ configs ...). Newer components are laid over it:
 
 Every overlay must find an "addons" folder; the package root is the folder
 that contains it. A markdown report of what changed is written to --report.
+
+  --install-json PATH  Also write an install manifest at PATH (relative to the
+                       package root): every file the package installs into
+                       game/csgo with its SHA-256, plus the --meta values.
+                       The updater uses it to tell untouched files from ones
+                       the user (or the Panel) changed.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import shutil
 import sys
 import tempfile
@@ -77,6 +85,27 @@ def apply_overlay(src_root: Path, dst_root: Path, protect: bool) -> dict[str, li
     return changes
 
 
+def is_installed_file(rel: str) -> bool:
+    """True for files that end up in game/csgo (the Panel .exe at the root does not)."""
+    return "/" in rel or not rel.lower().endswith(".exe")
+
+
+def write_install_json(root: Path, rel_path: str, meta: dict[str, str]) -> int:
+    files: dict[str, str] = {}
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        rel = path.relative_to(root).as_posix()
+        if rel == rel_path or not is_installed_file(rel):
+            continue
+        files[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+    data: dict[str, object] = {"schema": 1, **meta, "files": files}
+    if "build" in data:
+        data["build"] = int(str(data["build"]))
+    target = root / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8", newline="\n")
+    return len(files)
+
+
 def write_zip(root_parent: Path, out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
@@ -97,7 +126,18 @@ def main() -> int:
                     help="file that must exist in the final package (relative to its root)")
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--report", type=Path)
+    ap.add_argument("--install-json", metavar="PATH",
+                    help="write an install manifest at this path (relative to the package root)")
+    ap.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE",
+                    help="extra field for the install manifest (repeatable)")
     args = ap.parse_args()
+
+    meta: dict[str, str] = {}
+    for item in args.meta:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            ap.error(f"--meta expects KEY=VALUE, got {item!r}")
+        meta[key] = value
 
     report = [f"### {args.out.name}", "", f"Base: `{args.base.name}`", ""]
     with tempfile.TemporaryDirectory() as tmp:
@@ -133,6 +173,10 @@ def main() -> int:
         if missing:
             print("error: required files missing from package:\n  " + "\n  ".join(missing), file=sys.stderr)
             return 1
+
+        if args.install_json:
+            count = write_install_json(root, args.install_json, meta)
+            report.append(f"- **install manifest** `{args.install_json}`: {count} files")
 
         write_zip(base_dir, args.out)
 
