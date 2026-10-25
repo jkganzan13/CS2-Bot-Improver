@@ -1,0 +1,296 @@
+name: Release package
+
+# Rebuilds the Windows packages from the upstream release, with:
+#   - CounterStrikeSharp and Metamod at the versions in release/versions.env
+#   - every CounterStrikeSharp plugin built from the pinned submodules
+#   - the Metamod plugins (BotController, BotHider, BotVision) built from the pinned submodules
+# Run it from the Actions tab. Leave "release" off for a test build (zips appear as a run artifact).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish a GitHub release on this repo"
+        type: boolean
+        default: false
+      tag:
+        description: "Release tag (default: <base tag>-fork.<run number>)"
+        type: string
+        default: ""
+      native:
+        description: "Rebuild the Metamod plugins from source (off = keep the base package's copies)"
+        type: boolean
+        default: true
+  # Test build (never publishes) when the packaging setup changes
+  pull_request:
+    paths:
+      - release/**
+      - .github/workflows/release-package.yml
+      - .gitmodules
+      - addons/**
+
+concurrency:
+  group: release-package-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------ versions
+  versions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      base_repo: ${{ steps.v.outputs.BASE_REPO }}
+      base_tag: ${{ steps.v.outputs.BASE_TAG }}
+      css_tag: ${{ steps.v.outputs.CSS_TAG }}
+      mms_build: ${{ steps.v.outputs.MMS_BUILD }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        run: |
+          grep -E '^[A-Z_]+=' release/versions.env | tee -a "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------- CounterStrikeSharp plugins
+  managed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Build plugins
+        run: |
+          set -euo pipefail
+          P=addons/counterstrikesharp/plugins
+          STAGE=out/managed/addons/counterstrikesharp
+          mkdir -p "$STAGE/plugins" "$STAGE/shared"
+
+          build() {  # build <csproj> <output dir>
+            echo "::group::dotnet build $1"
+            dotnet build "$1" -c Release -o "$2" -nologo
+            echo "::endgroup::"
+          }
+          stage() {  # stage <build dir> <dll name> <dest dir>
+            test -f "$1/$2" || { echo "::error::$2 was not produced"; exit 1; }
+            mkdir -p "$3"
+            cp "$1/$2" "$3/"
+          }
+
+          # BotController + BotHider managed parts (also needed by BotState)
+          build addons/BotController/csharp/BotControllerImpl/BotControllerImpl.csproj out/build/BotController
+          stage out/build/BotController BotControllerImpl.dll "$STAGE/plugins/BotControllerImpl"
+          stage out/build/BotController BotControllerApi.dll  "$STAGE/shared/BotControllerApi"
+
+          build addons/BotHider/csharp/BotHiderImpl/BotHiderImpl.csproj out/build/BotHider
+          stage out/build/BotHider BotHiderImpl.dll "$STAGE/plugins/BotHiderImpl"
+          stage out/build/BotHider BotHiderApi.dll  "$STAGE/shared/BotHiderApi"
+          if [ -d out/build/BotHider/shared ]; then cp -r out/build/BotHider/shared/. "$STAGE/shared/"; fi
+
+          mkdir -p "$P/BotState/libs"
+          cp out/build/BotController/BotControllerApi.dll "$P/BotState/libs/"
+
+          for name in BotAI BotAimImprover BotBuy BotRandomizer BotState NadeSystem RoundDamageRecap; do
+            build "$P/$name/$name.csproj" "out/build/$name"
+            stage "out/build/$name" "$name.dll" "$STAGE/plugins/$name"
+          done
+          # BotRandomizer reads its catalogs from its plugin folder
+          cp "$P"/BotRandomizer/*.json "$STAGE/plugins/BotRandomizer/"
+
+          # Plugin data kept in this repo (grenade lineups etc.)
+          cp -r addons/counterstrikesharp/data "$STAGE/"
+
+          find out/managed -type f | sort
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: managed
+          path: out/managed/
+          if-no-files-found: error
+
+  # ------------------------------------------------------- Metamod plugins
+  native:
+    if: github.event_name != 'workflow_dispatch' || inputs.native
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [BotController, BotHider, BotVision]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch ${{ matrix.plugin }} and its SDKs
+        shell: bash
+        run: git submodule update --init --recursive --depth 1 addons/${{ matrix.plugin }}
+
+      - name: Build
+        shell: pwsh
+        working-directory: addons/${{ matrix.plugin }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ matrix.plugin }}' -eq 'BotVision') {
+            ./build.ps1 -Windows
+          } elseif ('${{ matrix.plugin }}' -eq 'BotHider') {
+            cmake -B build -G "Visual Studio 18 2026" -A x64 -S .
+            cmake --build build --config Release
+          } else {
+            cmake -B build -A x64 -S .
+            cmake --build build --config Release
+          }
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=addons/${{ matrix.plugin }}/build/package
+          [ "${{ matrix.plugin }}" = BotVision ] && src=addons/BotVision/dist/windows
+          dll="$src/addons/${{ matrix.plugin }}/bin/win64/${{ matrix.plugin }}.dll"
+          test -f "$dll" || { echo "::error::$dll was not produced"; exit 1; }
+          mkdir -p out/native
+          cp -r "$src/." out/native/
+          # Managed parts come from the managed job
+          rm -rf out/native/addons/counterstrikesharp
+          find out/native -type f | sort
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.plugin }}
+          path: out/native/
+          if-no-files-found: error
+
+  # ------------------------------------------------------------- package
+  package:
+    needs: [versions, managed, native]
+    if: always() && needs.versions.result == 'success' && needs.managed.result == 'success' && (needs.native.result == 'success' || needs.native.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE_REPO: ${{ needs.versions.outputs.base_repo }}
+      BASE_TAG: ${{ needs.versions.outputs.base_tag }}
+      CSS_TAG: ${{ needs.versions.outputs.css_tag }}
+      MMS_BUILD: ${{ needs.versions.outputs.mms_build }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: overlays
+
+      - name: Download base release, CounterStrikeSharp and Metamod
+        run: |
+          set -euo pipefail
+          mkdir -p base deps
+          gh release download "$BASE_TAG" -R "$BASE_REPO" -D base
+          ls -la base
+
+          gh release download "$CSS_TAG" -R roflmuffin/CounterStrikeSharp -D deps/css -p '*with-runtime*windows*'
+          css_zip=$(ls deps/css/*.zip | head -1)
+          test -n "$css_zip" || { echo "::error::no with-runtime Windows asset in CounterStrikeSharp $CSS_TAG"; exit 1; }
+          mv "$css_zip" deps/counterstrikesharp.zip
+
+          mms_url=https://mms.alliedmods.net/mmsdrop/2.0
+          if [ "$MMS_BUILD" = latest ]; then
+            mms_file=$(curl -fsSL "$mms_url/mmsource-latest-windows" | tr -d '\r\n')
+          else
+            mms_file="mmsource-2.0.0-git${MMS_BUILD}-windows.zip"
+          fi
+          echo "Metamod: $mms_file"
+          curl -fsSL -o deps/metamod.zip "$mms_url/$mms_file"
+          echo "MMS_FILE=$mms_file" >> "$GITHUB_ENV"
+          echo "CSS_FILE=$(basename "$css_zip")" >> "$GITHUB_ENV"
+
+      - name: Repack Windows packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          overlay_args=()
+          for d in overlays/*/; do overlay_args+=(--overlay "$d"); done
+
+          {
+            echo "## Components"
+            echo
+            echo "| Component | Version |"
+            echo "| --- | --- |"
+            echo "| Base package | $BASE_REPO $BASE_TAG |"
+            echo "| CounterStrikeSharp | $CSS_TAG ($CSS_FILE) |"
+            echo "| Metamod:Source | $MMS_FILE |"
+            git submodule status | awk '{sha=$1; sub(/^[-+U ]/, "", sha); printf "| %s | %s |\n", $2, substr(sha,1,7)}'
+            echo
+            echo "## Package changes"
+            echo
+          } > report.md
+
+          found=0
+          for zip in base/*.zip; do
+            case "$(basename "$zip")" in *[Ll]inux*) continue;; esac  # Windows only
+            found=1
+            python3 -I release/repack.py \
+              --base "$zip" \
+              --runtime deps/counterstrikesharp.zip \
+              --runtime deps/metamod.zip \
+              "${overlay_args[@]}" \
+              --require addons/counterstrikesharp/bin/win64/counterstrikesharp.dll \
+              --require addons/counterstrikesharp/api/CounterStrikeSharp.API.dll \
+              --require addons/counterstrikesharp/plugins/BotAI/BotAI.dll \
+              --out "dist/$(basename "$zip")" \
+              --report report.md
+          done
+          test "$found" = 1 || { echo "::error::no Windows zip in $BASE_REPO $BASE_TAG"; exit 1; }
+
+          # Carry the other release files (the Panel .exe etc.) through unchanged
+          find base -maxdepth 1 -type f ! -name '*.zip' -exec cp {} dist/ \;
+          ls -la dist
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - id: tag
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="${BASE_TAG}-fork.${{ github.run_number }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: |
+            dist/
+            report.md
+          if-no-files-found: error
+
+  # ------------------------------------------------------------- release
+  release:
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.release && needs.package.result == 'success'
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.package.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          {
+            echo "Repackaged build for the current CS2 update. Windows only."
+            echo
+            cat report.md
+          } > notes.md
+          gh release create "$TAG" dist/* -R "${{ github.repository }}" \
+            --target "${{ github.sha }}" --title "$TAG" --notes-file notes.md
