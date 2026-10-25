@@ -56,6 +56,10 @@ On Windows, please download **CS2BotImprover_rules_unchanged.zip** to preserve t
 
    <img width="339" height="129" alt="Selecting Bot Mode and launching CS2 from the Panel" src="https://github.com/user-attachments/assets/dc806991-c940-43cf-a614-f49012fae4a7" />
 
+#### Updating (packages from [this fork's releases](https://github.com/jkganzan13/CS2-Bot-Improver/releases))
+
+Close CS2 and double-click **CS2BotImprover-Update.cmd** in `game/csgo`. It downloads the latest release, checks its signature and checksums, and updates the files in place. Settings you changed are kept, and every replaced file is backed up to `addons/cs2botimprover/backups`. The Panel `.exe` is not updated this way.
+
 ### Linux
 
 1. Download and extract **CS2BotImprover_for_Linux.zip**.
